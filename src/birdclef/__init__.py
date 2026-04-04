@@ -1,0 +1,1 @@
+"""BirdCLEF competition pipeline package."""

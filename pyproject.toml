@@ -1,0 +1,35 @@
+[project]
+name = "birdclef-pipeline"
+version = "0.1.0"
+description = "Local-first BirdCLEF competition pipeline extracted from a notebook."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "librosa",
+  "llvmlite==0.45.1",
+  "matplotlib",
+  "numba==0.62.1",
+  "numpy==1.26.4",
+  "opencv-python==4.10.0.84",
+  "pandas",
+  "safetensors",
+  "scikit-learn",
+  "soundfile",
+  "timm",
+  "torch==2.2.2",
+  "torchaudio==2.2.2",
+  "tqdm",
+]
+
+[project.scripts]
+birdclef = "birdclef.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/birdclef"]
+
+[tool.uv]
+package = true
