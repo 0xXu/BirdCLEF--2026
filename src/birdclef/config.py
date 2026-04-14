@@ -66,7 +66,7 @@ class CFG:
     tta_enabled: bool = True
     tta_crops: int = 3
     device: str = field(
-        default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu"
+        default_factory=lambda: "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     )
     cache_override: Path | None = None
 

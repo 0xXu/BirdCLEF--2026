@@ -27,7 +27,7 @@ class BirdCLEFModel(nn.Module):
 
         self.backbone = timm.create_model(
             cfg.model_name,
-            pretrained=False,
+            pretrained=not cfg.pretrained_path.exists(),
             in_chans=3,
             num_classes=0,
             global_pool="",
@@ -60,7 +60,7 @@ class BirdCLEFModel(nn.Module):
 
     def _load_local_backbone_weights(self, weight_dir: Path) -> None:
         if not weight_dir.exists():
-            print(f"Backbone weights not found at {weight_dir}, using random init")
+            print(f"Backbone local weights not found at {weight_dir}, falling back to timm pretrained weights.")
             return
 
         weight_file = None
@@ -70,7 +70,7 @@ class BirdCLEFModel(nn.Module):
                 weight_file = found[0]
                 break
         if weight_file is None:
-            print(f"No backbone weight file found in {weight_dir}, using random init")
+            print(f"No backbone weight file found in {weight_dir}, falling back to timm pretrained weights.")
             return
 
         print(f"Loading backbone weights from {weight_file.name}")

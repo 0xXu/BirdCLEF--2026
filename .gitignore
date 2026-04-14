@@ -3,4 +3,17 @@ __pycache__/
 *.pyc
 .DS_Store
 
+# Kaggle / Data
 kaggle/working/
+kaggle/input/
+*.zip
+
+# Checkpoints / Cache
+*.pth
+*.npy
+.ipynb_checkpoints/
+
+# Build
+build/
+dist/
+*.egg-info/
