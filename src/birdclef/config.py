@@ -26,24 +26,27 @@ class CFG:
     in_channels: int = 1
 
     fs: int = 32_000
-    target_duration: float = 5.0
-    target_shape: tuple[int, int] = (64, 64)
-    n_fft: int = 1024
-    hop_length: int = 512
-    n_mels: int = 128
-    fmin: int = 50
-    fmax: int = 14_000
-
-    pcen_gain: float = 0.98
-    pcen_bias: float = 2.0
-    pcen_power: float = 0.5
-    pcen_time_constant: float = 0.4
-    pcen_eps: float = 1e-6
+    target_duration: float = 10.0
+    target_shape: tuple[int, int] = (256, 256)
+    n_fft: int = 2048
+    win_length: int = 626
+    hop_length: int = 313
+    n_mels: int = 256
+    fmin: int = 20
+    fmax: int = 16_000
+    mel_power: float = 2.0
+    mel_top_db: float = 80.0
+    mel_norm: str = "slaney"
+    mel_scale: str = "htk"
 
     epochs: int = 6
-    batch_size: int = 32
+    batch_size: int = 16
     n_fold: int = 5
     selected_folds: list[int] = field(default_factory=lambda: [0])
+    cv_strategy: str = "mlsgkf_audio_id"
+    group_col: str = "audio_id"
+    save_oof: bool = True
+    rank_normalize_oof: bool = True
     use_compile: bool = False
 
     lr: float = 7e-4
@@ -84,7 +87,8 @@ class CFG:
         if self.cache_override is not None:
             return self.cache_override
         height, _ = self.target_shape
-        return self.output_dir / f"pcen_cache_{height}.npy"
+        duration = f"{self.target_duration:g}s".replace(".", "p")
+        return self.output_dir / f"logmel_cache_{duration}_{height}.npy"
 
 
 def parse_folds(raw: str) -> list[int]:
@@ -101,8 +105,12 @@ def parse_args() -> argparse.Namespace:
         cmd.add_argument("--data-root", type=Path, default=None)
         cmd.add_argument("--output-dir", type=Path, default=Path("./kaggle/working"))
         cmd.add_argument("--epochs", type=int, default=6)
-        cmd.add_argument("--batch-size", type=int, default=32)
+        cmd.add_argument("--batch-size", type=int, default=16)
         cmd.add_argument("--folds", type=str, default="0")
+        cmd.add_argument("--cv-strategy", type=str, default="mlsgkf_audio_id")
+        cmd.add_argument("--group-col", type=str, default="audio_id")
+        cmd.add_argument("--disable-oof", action="store_true")
+        cmd.add_argument("--disable-rank-oof", action="store_true")
         cmd.add_argument("--debug", action="store_true")
         cmd.add_argument("--num-workers", type=int, default=0)
         cmd.add_argument("--cache-path", type=Path, default=None)
@@ -110,7 +118,7 @@ def parse_args() -> argparse.Namespace:
     eda = subparsers.add_parser("eda", help="Run dataset summaries and save plots.")
     add_shared_args(eda)
 
-    cache = subparsers.add_parser("cache", help="Precompute and save PCEN cache.")
+    cache = subparsers.add_parser("cache", help="Precompute and save LogMel cache.")
     add_shared_args(cache)
     cache.add_argument("--cache-workers", type=int, default=4)
 
@@ -124,6 +132,9 @@ def parse_args() -> argparse.Namespace:
     add_shared_args(infer)
     infer.add_argument("--tta-crops", type=int, default=3)
     infer.add_argument("--disable-tta", action="store_true")
+
+    merge_oof = subparsers.add_parser("merge-oof", help="Merge per-fold OOF files and rebuild metrics.")
+    add_shared_args(merge_oof)
 
     all_cmd = subparsers.add_parser(
         "all", help="Run EDA, cache build, training, and inference sequentially."
@@ -158,6 +169,10 @@ def build_cfg(args: argparse.Namespace) -> CFG:
     cfg.debug = args.debug
     cfg.num_workers = args.num_workers
     cfg.selected_folds = parse_folds(args.folds)
+    cfg.cv_strategy = args.cv_strategy
+    cfg.group_col = args.group_col
+    cfg.save_oof = not args.disable_oof
+    cfg.rank_normalize_oof = not args.disable_rank_oof
     cfg.cache_override = args.cache_path
 
     if hasattr(args, "lr"):

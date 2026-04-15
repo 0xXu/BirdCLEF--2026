@@ -21,7 +21,7 @@ def main() -> None:
 
     print(
         f"device={cfg.device} model={cfg.model_name} batch={cfg.batch_size} "
-        f"epochs={cfg.epochs} folds={cfg.selected_folds}"
+        f"epochs={cfg.epochs} folds={cfg.selected_folds} cv={cfg.cv_strategy}"
     )
 
     if args.command == "eda":
@@ -42,6 +42,19 @@ def main() -> None:
         from birdclef.infer import predict_soundscapes_tta
 
         predict_soundscapes_tta(cfg)
+        return
+    if args.command == "merge-oof":
+        from birdclef.validation import merge_oof_reports, save_oof_metrics
+
+        merged = merge_oof_reports(cfg)
+        if merged is None:
+            raise FileNotFoundError(f"No oof_predictions_fold*.csv files found in {cfg.output_dir}")
+        per_class = save_oof_metrics(merged, cfg)
+        valid_auc = per_class["auc"].dropna()
+        if len(valid_auc):
+            print(f"Merged OOF rows={len(merged)} macro_auc={valid_auc.mean():.4f}")
+        else:
+            print(f"Merged OOF rows={len(merged)} macro_auc=nan")
         return
     if args.command == "all":
         from birdclef.eda import run_eda

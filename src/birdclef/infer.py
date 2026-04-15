@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from birdclef.audio import audio2pcen
+from birdclef.audio import audio2logmel
 from birdclef.config import CFG
 from birdclef.deps import cv2, librosa, require_dependencies, tqdm
 from birdclef.model import BirdCLEFModel
@@ -15,10 +15,10 @@ def audio_to_tensor(seg: np.ndarray, cfg: CFG) -> torch.Tensor:
         seg = np.pad(seg, (0, cfg.target_samples - len(seg)))
     else:
         seg = seg[: cfg.target_samples]
-    pcen = audio2pcen(seg, cfg)
-    if pcen.shape != cfg.target_shape:
-        pcen = cv2.resize(pcen, cfg.target_shape, interpolation=cv2.INTER_LINEAR)
-    return torch.tensor(pcen, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    logmel = audio2logmel(seg, cfg)
+    if logmel.shape != cfg.target_shape:
+        logmel = cv2.resize(logmel, cfg.target_shape, interpolation=cv2.INTER_LINEAR)
+    return torch.tensor(logmel, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
 
 
 def discover_checkpoints(cfg: CFG) -> list:
@@ -64,18 +64,20 @@ def predict_soundscapes_tta(cfg: CFG) -> pd.DataFrame:
 
         seg_preds = []
         for t in range(0, 60, 5):
-            center = t * cfg.fs
             audio_len = len(audio)
             half = cfg.target_samples // 2
+            target_center = int((t + 2.5) * cfg.fs)
+            base_offset = target_center - half
             max_offset = max(0, audio_len - cfg.target_samples)
 
             if n_crops == 1:
-                offsets = [max(0, min(center, max_offset))]
+                offsets = [max(0, min(base_offset, max_offset))]
             else:
+                shift = cfg.target_samples // 4
                 offsets = [
-                    max(0, min(center, max_offset)),
-                    max(0, min(center + half // 2, max_offset)),
-                    max(0, min(center + cfg.target_samples - half, max_offset)),
+                    max(0, min(base_offset - shift, max_offset)),
+                    max(0, min(base_offset, max_offset)),
+                    max(0, min(base_offset + shift, max_offset)),
                 ][:n_crops]
 
             crop_probs = []

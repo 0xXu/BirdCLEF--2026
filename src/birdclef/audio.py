@@ -11,8 +11,8 @@ from birdclef.config import CFG
 from birdclef.deps import T, cv2, librosa, require_dependencies, sf
 
 
-def audio2pcen(audio_data: np.ndarray, cfg: CFG) -> np.ndarray:
-    require_dependencies(("librosa", librosa), ("torchaudio", T))
+def audio2logmel(audio_data: np.ndarray, cfg: CFG) -> np.ndarray:
+    require_dependencies(("torchaudio", T))
     if np.isnan(audio_data).any():
         fill_value = float(np.nanmean(audio_data)) if not np.isnan(audio_data).all() else 0.0
         audio_data = np.nan_to_num(audio_data, nan=fill_value)
@@ -21,25 +21,19 @@ def audio2pcen(audio_data: np.ndarray, cfg: CFG) -> np.ndarray:
     mel_transform = T.MelSpectrogram(
         sample_rate=cfg.fs,
         n_fft=cfg.n_fft,
+        win_length=cfg.win_length,
         hop_length=cfg.hop_length,
         n_mels=cfg.n_mels,
         f_min=cfg.fmin,
         f_max=cfg.fmax,
-        power=1.0,
+        power=cfg.mel_power,
+        norm=cfg.mel_norm,
+        mel_scale=cfg.mel_scale,
     )
-    spec = mel_transform(waveform).squeeze(0).numpy()
-    pcen = librosa.pcen(
-        spec * (2**31),
-        sr=cfg.fs,
-        hop_length=cfg.hop_length,
-        gain=cfg.pcen_gain,
-        bias=cfg.pcen_bias,
-        power=cfg.pcen_power,
-        time_constant=cfg.pcen_time_constant,
-        eps=cfg.pcen_eps,
-    ).astype(np.float32)
-    mn, mx = pcen.min(), pcen.max()
-    return ((pcen - mn) / (mx - mn + 1e-8)).astype(np.float32)
+    db_transform = T.AmplitudeToDB(stype="power", top_db=cfg.mel_top_db)
+    logmel = db_transform(mel_transform(waveform)).squeeze(0).numpy().astype(np.float32)
+    mn, mx = float(logmel.min()), float(logmel.max())
+    return ((logmel - mn) / (mx - mn + 1e-7)).astype(np.float32)
 
 
 def process_audio_file(
@@ -61,22 +55,24 @@ def process_audio_file(
         if len(audio) < cfg.target_samples:
             audio = np.tile(audio, math.ceil(cfg.target_samples / max(1, len(audio))))
 
+        max_offset = max(0, len(audio) - cfg.target_samples)
         start = int(float(offset) * cfg.fs) if offset is not None else max(
             0, int(len(audio) / 2 - cfg.target_samples / 2)
         )
+        start = max(0, min(start, max_offset))
         seg = audio[start : start + cfg.target_samples]
         if len(seg) < cfg.target_samples:
             seg = np.pad(seg, (0, cfg.target_samples - len(seg)))
 
-        pcen = audio2pcen(seg, cfg)
-        if pcen.shape != cfg.target_shape:
-            pcen = cv2.resize(pcen, cfg.target_shape, interpolation=cv2.INTER_LINEAR)
-        return pcen.astype(np.float32)
+        logmel = audio2logmel(seg, cfg)
+        if logmel.shape != cfg.target_shape:
+            logmel = cv2.resize(logmel, cfg.target_shape, interpolation=cv2.INTER_LINEAR)
+        return logmel.astype(np.float32)
     except Exception:
         return None
 
 
-def precompute_all_pcen(df: pd.DataFrame, cfg: CFG, n_workers: int = 4) -> np.ndarray:
+def precompute_all_logmel(df: pd.DataFrame, cfg: CFG, n_workers: int = 4) -> np.ndarray:
     rows = len(df)
     height, width = cfg.target_shape
     cache = np.zeros((rows, height, width), dtype=np.float16)
@@ -88,7 +84,7 @@ def precompute_all_pcen(df: pd.DataFrame, cfg: CFG, n_workers: int = 4) -> np.nd
         spec = process_audio_file(row["filepath"], cfg, offset=offset)
         return i, spec.astype(np.float16) if spec is not None else None
 
-    print(f"Computing PCEN cache: {rows} files with {n_workers} worker(s)")
+    print(f"Computing LogMel cache: {rows} files with {n_workers} worker(s)")
     start_time = time.time()
     failed = 0
 
@@ -117,10 +113,15 @@ def load_or_build_cache(df: pd.DataFrame, cfg: CFG, n_workers: int = 4) -> np.nd
     if cache_path.exists():
         print(f"Loading cache from {cache_path}")
         cache = np.load(str(cache_path))
+        if len(cache) != len(df):
+            raise ValueError(
+                f"Cache row count mismatch: cache has {len(cache)} rows but dataframe has {len(df)}. "
+                f"Remove {cache_path} or pass --cache-path for a rebuilt cache."
+            )
         print(f"Loaded cache {cache.shape} ({cache.nbytes/1e9:.2f} GB)")
         return cache
 
-    cache = precompute_all_pcen(df, cfg, n_workers=n_workers)
+    cache = precompute_all_logmel(df, cfg, n_workers=n_workers)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(str(cache_path), cache)
     print(f"Saved cache to {cache_path}")

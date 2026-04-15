@@ -1,4 +1,5 @@
 import ast
+import re
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,41 @@ from birdclef.config import CFG
 from birdclef.utils import load_species_ids
 
 
+def _audio_id_from_filename(filename: object) -> str:
+    raw = str(filename)
+    return str(Path(raw).with_suffix(""))
+
+
+def _parse_soundscape_filename(filename: object) -> dict[str, object]:
+    stem = Path(str(filename)).stem
+    tokens = [token for token in re.split(r"[_\-\s]+", stem) if token]
+    site = tokens[0] if tokens else stem
+    date = next(
+        (
+            token
+            for token in tokens
+            if re.fullmatch(r"\d{8}", token) or re.fullmatch(r"\d{4}\d{2}\d{2}", token)
+        ),
+        None,
+    )
+    time_token = next(
+        (
+            token
+            for token in tokens
+            if re.fullmatch(r"\d{6}", token) or re.fullmatch(r"\d{2}:\d{2}:\d{2}", token)
+        ),
+        None,
+    )
+    hour = None
+    if time_token is not None:
+        hour = int(time_token[:2])
+    return {
+        "soundscape_site": site,
+        "soundscape_date": date,
+        "soundscape_hour": hour,
+    }
+
+
 def build_train_df(cfg: CFG) -> pd.DataFrame:
     taxonomy = pd.read_csv(cfg.taxonomy_csv)
     valid_labels = set(taxonomy["primary_label"].astype(str))
@@ -19,17 +55,36 @@ def build_train_df(cfg: CFG) -> pd.DataFrame:
     train_df = pd.read_csv(cfg.train_csv)
     train_df["primary_label"] = train_df["primary_label"].astype(str)
     train_df = train_df[train_df["primary_label"].isin(valid_labels)].copy()
+    train_df["audio_id"] = train_df["filename"].apply(_audio_id_from_filename)
     train_df["filepath"] = train_df["filename"].apply(lambda x: str(cfg.train_datadir / str(x)))
     train_df["source"] = "train_audio"
     train_df["offset"] = np.nan
+    train_df["start_sec"] = np.nan
+    train_df["end_sec"] = np.nan
+    train_df["soundscape_site"] = np.nan
+    train_df["soundscape_date"] = np.nan
+    train_df["soundscape_hour"] = np.nan
 
     sc_labels_df = pd.read_csv(cfg.sc_labels_csv)
 
     def hms_to_sec(ts: str) -> int:
+        if isinstance(ts, (int, float)) and not pd.isna(ts):
+            return int(ts)
         h, m, s = str(ts).split(":")
         return int(h) * 3600 + int(m) * 60 + int(s)
 
-    sc_labels_df["start_sec"] = sc_labels_df["start"].apply(hms_to_sec)
+    if "start_sec" not in sc_labels_df.columns:
+        sc_labels_df["start_sec"] = sc_labels_df["start"].apply(hms_to_sec)
+    if "end_sec" not in sc_labels_df.columns and "end" in sc_labels_df.columns:
+        sc_labels_df["end_sec"] = sc_labels_df["end"].apply(hms_to_sec)
+    dedup_cols = ["filename", "start_sec", "primary_label"]
+    if "end_sec" in sc_labels_df.columns:
+        dedup_cols.insert(2, "end_sec")
+    before_dedup = len(sc_labels_df)
+    sc_labels_df = sc_labels_df.drop_duplicates(subset=dedup_cols).reset_index(drop=True)
+    if before_dedup != len(sc_labels_df):
+        print(f"Dropped duplicated soundscape labels: {before_dedup - len(sc_labels_df)}")
+
     sc_dir = cfg.train_datadir.parent / "train_soundscapes"
     sc_rows = []
 
@@ -44,14 +99,23 @@ def build_train_df(cfg: CFG) -> pd.DataFrame:
         audio_path = sc_dir / row["filename"]
         if not audio_path.exists():
             continue
+        soundscape_meta = _parse_soundscape_filename(row["filename"])
+        end_sec = float(row.get("end_sec", row["start_sec"] + 5.0))
+        label_center = (float(row["start_sec"]) + end_sec) / 2.0
+        context_offset = max(0.0, label_center - cfg.target_duration / 2.0)
         sc_rows.append(
             {
+                "filename": row["filename"],
+                "audio_id": _audio_id_from_filename(row["filename"]),
                 "filepath": str(audio_path),
                 "primary_label": labels[0],
                 "secondary_labels": str(labels[1:]) if len(labels) > 1 else "[]",
                 "source": "soundscape",
-                "offset": float(row["start_sec"]),
+                "offset": context_offset,
+                "start_sec": float(row["start_sec"]),
+                "end_sec": end_sec,
                 "rating": 0.0,
+                **soundscape_meta,
             }
         )
 

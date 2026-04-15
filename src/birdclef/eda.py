@@ -321,7 +321,7 @@ def save_audio_examples(train_df, species_counts, cfg: CFG) -> None:
     random.shuffle(sample_labels)
     sample_labels = sample_labels[:4]
 
-    fig = plt.figure(figsize=(22, 14))
+    fig = plt.figure(figsize=(22, 10))
     fig.patch.set_facecolor("#0d1117")
 
     shown = 0
@@ -346,56 +346,35 @@ def save_audio_examples(train_df, species_counts, cfg: CFG) -> None:
             y=y,
             sr=cfg.fs,
             n_fft=cfg.n_fft,
+            win_length=cfg.win_length,
             hop_length=cfg.hop_length,
             n_mels=cfg.n_mels,
             fmin=cfg.fmin,
             fmax=cfg.fmax,
-            power=1.0,
+            power=cfg.mel_power,
+            norm=cfg.mel_norm,
+            htk=cfg.mel_scale == "htk",
         )
-        mel_db = librosa.amplitude_to_db(mel, ref=np.max)
-        pcen = librosa.pcen(
-            mel * (2**31),
-            sr=cfg.fs,
-            hop_length=cfg.hop_length,
-            gain=cfg.pcen_gain,
-            bias=cfg.pcen_bias,
-            power=cfg.pcen_power,
-            time_constant=cfg.pcen_time_constant,
-            eps=cfg.pcen_eps,
-        )
-        pcen_norm = (pcen - pcen.min()) / (pcen.max() - pcen.min() + 1e-8)
+        mel_db = librosa.power_to_db(mel, ref=np.max, top_db=cfg.mel_top_db)
+        mel_norm = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
 
-        ax_wave = fig.add_subplot(3, 4, shown)
+        ax_wave = fig.add_subplot(2, 4, shown)
         times = np.linspace(0, cfg.target_duration, len(y))
         ax_wave.plot(times, y, color=PALETTE[(shown - 1) % len(PALETTE)], linewidth=0.5)
         ax_wave.set_title(f"{label}\n{path.name}", fontsize=9)
 
-        ax_mel = fig.add_subplot(3, 4, 4 + shown)
-        librosa.display.specshow(
-            mel_db,
-            sr=cfg.fs,
-            hop_length=cfg.hop_length,
-            x_axis="time",
-            y_axis="mel",
-            fmin=cfg.fmin,
-            fmax=cfg.fmax,
-            ax=ax_mel,
-            cmap="magma",
-        )
-        ax_mel.set_title("Mel Spectrogram (dB)", fontsize=9)
-
-        ax_pcen = fig.add_subplot(3, 4, 8 + shown)
-        ax_pcen.imshow(
-            pcen_norm,
+        ax_mel = fig.add_subplot(2, 4, 4 + shown)
+        ax_mel.imshow(
+            mel_norm,
             aspect="auto",
             origin="lower",
-            cmap="viridis",
+            cmap="magma",
             extent=[0, cfg.target_duration, cfg.fmin, cfg.fmax],
         )
-        ax_pcen.set_title("PCEN (normalized)", fontsize=9)
+        ax_mel.set_title("LogMel dB (normalized)", fontsize=9)
 
     plt.suptitle("BirdCLEF 2026 EDA: Audio Examples", fontsize=14, y=1.01)
-    out_path = cfg.output_dir / "eda_mel_pcen.png"
+    out_path = cfg.output_dir / "eda_logmel.png"
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#0d1117")
     plt.close(fig)

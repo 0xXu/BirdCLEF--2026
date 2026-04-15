@@ -2,6 +2,7 @@ import gc
 import random
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,9 +12,16 @@ from torch.utils.data import DataLoader
 
 from birdclef.config import CFG
 from birdclef.dataset import BirdCLEFDataset, collate_fn, make_weighted_sampler
-from birdclef.deps import StratifiedKFold, require_dependencies, roc_auc_score, tqdm
+from birdclef.deps import require_dependencies, roc_auc_score, tqdm
 from birdclef.model import BirdCLEFModel
 from birdclef.deps import plt
+from birdclef.utils import load_species_ids
+from birdclef.validation import (
+    calculate_group_auc,
+    make_folds,
+    save_oof_report,
+    summarize_fold_distribution,
+)
 
 
 def mixup(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4) -> tuple[torch.Tensor, torch.Tensor]:
@@ -90,7 +98,8 @@ def calculate_auc(targets: np.ndarray, outputs: np.ndarray) -> float:
     probs = 1 / (1 + np.exp(-outputs))
     aucs = []
     for idx in range(targets.shape[1]):
-        if targets[:, idx].sum() > 0:
+        positives = targets[:, idx].sum()
+        if 0 < positives < targets.shape[0]:
             aucs.append(roc_auc_score(targets[:, idx], probs[:, idx]))
     return float(np.mean(aucs)) if aucs else 0.0
 
@@ -148,30 +157,26 @@ def validate(
     loader: DataLoader,
     criterion: nn.Module,
     cfg: CFG,
-) -> tuple[float, float]:
+) -> tuple[float, float, np.ndarray, np.ndarray]:
     model.eval()
     auc_outputs = []
     auc_targets = []
-    total_loss = 0.0
-    collect_from = max(0, len(loader) - 30)
+    losses = []
 
     with torch.no_grad():
-        for step, batch in enumerate(tqdm(loader, desc="Validation")):
+        for batch in tqdm(loader, desc="Validation"):
             inputs = batch["melspec"].to(cfg.device)
             targets = batch["target"].to(cfg.device)
             outputs = model(inputs)
-            if step >= collect_from:
-                auc_outputs.append(outputs.cpu().numpy())
-                auc_targets.append(targets.cpu().numpy())
-                total_loss += criterion(outputs, targets).item()
+            losses.append(criterion(outputs, targets).item())
+            auc_outputs.append(outputs.cpu().numpy())
+            auc_targets.append(targets.cpu().numpy())
 
-    val_auc = (
-        calculate_auc(np.concatenate(auc_targets), np.concatenate(auc_outputs))
-        if auc_outputs
-        else 0.0
-    )
-    avg_loss = total_loss / max(len(auc_outputs), 1)
-    return avg_loss, val_auc
+    outputs_arr = np.concatenate(auc_outputs) if auc_outputs else np.zeros((0, 0), dtype=np.float32)
+    targets_arr = np.concatenate(auc_targets) if auc_targets else np.zeros((0, 0), dtype=np.float32)
+    val_auc = calculate_auc(targets_arr, outputs_arr) if len(outputs_arr) else 0.0
+    avg_loss = float(np.mean(losses)) if losses else 0.0
+    return avg_loss, val_auc, outputs_arr, targets_arr
 
 
 def plot_training_history(history: dict[int, dict[str, list[float]]], cfg: CFG) -> None:
@@ -205,27 +210,44 @@ def plot_training_history(history: dict[int, dict[str, list[float]]], cfg: CFG) 
 
 
 def run_training(df, cache: np.ndarray, cfg: CFG) -> dict[int, dict[str, list[float]]]:
-    require_dependencies(("scikit-learn", StratifiedKFold), ("matplotlib", plt))
+    require_dependencies(("scikit-learn", roc_auc_score), ("matplotlib", plt))
     criterion = FocalBCELoss(
         gamma=cfg.focal_gamma,
         focal_w=cfg.focal_weight,
         bce_w=cfg.bce_weight,
         smoothing=cfg.label_smoothing,
     )
-    skf = StratifiedKFold(n_splits=cfg.n_fold, shuffle=True, random_state=cfg.seed)
-    history = {}
-    best_scores = []
+    species_ids = load_species_ids(cfg)
+    folds = make_folds(df, cfg)
+    fold_summary = summarize_fold_distribution(df, folds, cfg)
+    fold_summary_path = cfg.output_dir / "fold_distribution.csv"
+    fold_summary.to_csv(fold_summary_path, index=False)
+    print(f"Saved fold distribution to {fold_summary_path}")
+    print(fold_summary.to_string(index=False))
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df["primary_label"])):
+    oof_logits = np.zeros((len(df), len(species_ids)), dtype=np.float32)
+    oof_targets = np.zeros((len(df), len(species_ids)), dtype=np.float32)
+    oof_fold_ids = np.full(len(df), -1, dtype=np.int32)
+
+    history = {}
+    best_scores: list[tuple[int, float]] = []
+
+    for split in folds:
+        fold = split.fold
         if fold not in cfg.selected_folds:
             continue
 
         print(f"\n{'=' * 40} Fold {fold} {'=' * 40}")
+        train_idx = split.train_idx
+        val_idx = split.val_idx
         train_df_f = df.iloc[train_idx].reset_index(drop=True)
         val_df_f = df.iloc[val_idx].reset_index(drop=True)
         train_cache_f = cache[train_idx]
         val_cache_f = cache[val_idx]
-        print(f"Train={len(train_df_f)} Val={len(val_df_f)}")
+        print(
+            f"Train={len(train_df_f)} Val={len(val_df_f)} "
+            f"strategy={split.strategy} group={split.group_col}"
+        )
 
         train_ds = BirdCLEFDataset(train_df_f, train_cache_f, cfg, mode="train")
         val_ds = BirdCLEFDataset(val_df_f, val_cache_f, cfg, mode="valid")
@@ -266,11 +288,13 @@ def run_training(df, cache: np.ndarray, cfg: CFG) -> dict[int, dict[str, list[fl
         scheduler = get_scheduler(optimizer, cfg)
         best_auc = 0.0
         fold_history = {"train_loss": [], "val_loss": [], "train_auc": [], "val_auc": []}
+        best_val_logits = None
+        best_val_targets = None
 
         for epoch in range(cfg.epochs):
             print(f"\nEpoch {epoch + 1}/{cfg.epochs}")
             train_loss, train_auc = train_one_epoch(model, train_loader, optimizer, criterion, cfg)
-            val_loss, val_auc = validate(model, val_loader, criterion, cfg)
+            val_loss, val_auc, val_logits, val_targets = validate(model, val_loader, criterion, cfg)
             scheduler.step()
 
             fold_history["train_loss"].append(train_loss)
@@ -283,6 +307,8 @@ def run_training(df, cache: np.ndarray, cfg: CFG) -> dict[int, dict[str, list[fl
 
             if val_auc > best_auc:
                 best_auc = val_auc
+                best_val_logits = val_logits
+                best_val_targets = val_targets
                 ckpt_path = cfg.output_dir / f"model_fold{fold}.pth"
                 torch.save(
                     {
@@ -296,16 +322,40 @@ def run_training(df, cache: np.ndarray, cfg: CFG) -> dict[int, dict[str, list[fl
                 print(f"New best checkpoint saved to {ckpt_path}")
 
         history[fold] = fold_history
-        best_scores.append(best_auc)
+        best_scores.append((fold, best_auc))
         print(f"Fold {fold} best AUC: {best_auc:.4f}")
+        if best_val_logits is not None and best_val_targets is not None:
+            oof_logits[val_idx] = best_val_logits
+            oof_targets[val_idx] = best_val_targets
+            oof_fold_ids[val_idx] = fold
+            source_auc = calculate_group_auc(
+                val_df_f,
+                best_val_targets,
+                best_val_logits,
+                group_col="source",
+                from_logits=True,
+            )
+            if not source_auc.empty:
+                print("Best validation AUC by source:")
+                print(source_auc.to_string(index=False))
 
         del model, optimizer, scheduler, train_loader, val_loader
         gc.collect()
 
     if best_scores:
-        for fold, score in zip(cfg.selected_folds, best_scores):
+        pd.DataFrame(
+            [{"fold": fold, "best_auc": score} for fold, score in best_scores]
+        ).to_csv(cfg.output_dir / "fold_metrics.csv", index=False)
+        for fold, score in best_scores:
             print(f"Fold {fold}: {score:.4f}")
-        print(f"Mean AUC: {np.mean(best_scores):.4f}")
+        print(f"Mean AUC: {np.mean([score for _, score in best_scores]):.4f}")
+
+    if cfg.save_oof:
+        per_class = save_oof_report(df, oof_logits, oof_targets, oof_fold_ids, cfg)
+        if per_class is not None:
+            valid_auc = per_class["auc"].dropna()
+            if len(valid_auc):
+                print("OOF macro AUC:", f"{valid_auc.mean():.4f}")
 
     plot_training_history(history, cfg)
     return history
