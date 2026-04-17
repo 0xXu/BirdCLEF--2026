@@ -359,6 +359,7 @@ def save_oof_report(
     report_df = df.iloc[np.flatnonzero(valid_mask)].reset_index(drop=True).copy()
     report_df.insert(0, "fold", fold_ids[valid_mask])
     for idx, label in enumerate(species_ids):
+        report_df[f"target_{label}"] = oof_targets[valid_mask, idx]
         report_df[f"pred_{label}"] = probs[:, idx]
 
     for fold in sorted(report_df["fold"].unique()):
@@ -399,11 +400,16 @@ def save_oof_metrics(oof_df: pd.DataFrame, cfg: CFG) -> pd.DataFrame:
     out_dir = Path(cfg.output_dir)
     species_ids = load_species_ids(cfg)
     pred_cols = [f"pred_{label}" for label in species_ids]
+    target_cols = [f"target_{label}" for label in species_ids]
     missing = [col for col in pred_cols if col not in oof_df.columns]
     if missing:
         raise KeyError(f"OOF predictions missing {len(missing)} prediction columns")
 
     targets = make_multilabel_targets(oof_df, species_ids)
+    if all(col in oof_df.columns for col in target_cols):
+        saved_targets = oof_df[target_cols].to_numpy(dtype=np.float32)
+        complete_rows = ~np.isnan(saved_targets).any(axis=1)
+        targets[complete_rows] = saved_targets[complete_rows]
     probs = oof_df[pred_cols].to_numpy(dtype=np.float32)
 
     per_class = calculate_per_class_auc(
@@ -443,4 +449,10 @@ def save_oof_metrics(oof_df: pd.DataFrame, cfg: CFG) -> pd.DataFrame:
             .reset_index()
         )
         taxonomy_auc.to_csv(out_dir / "taxonomy_group_auc.csv", index=False)
+
+    from birdclef.postprocess import fit_calibration_table_from_oof
+    from birdclef.sampling import build_hard_negative_table_from_oof
+
+    fit_calibration_table_from_oof(oof_df, species_ids, cfg)
+    build_hard_negative_table_from_oof(oof_df, species_ids, cfg)
     return per_class

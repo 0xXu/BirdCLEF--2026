@@ -1,19 +1,74 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# OS / editor
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
 
-# Kaggle / Data
-kaggle/working/
-kaggle/input/
-*.zip
-
-# Checkpoints / Cache
-*.pth
-*.npy
-.ipynb_checkpoints/
-
-# Build
+# Build / package
 build/
 dist/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Kaggle data, local weights, cache, and training outputs
+kaggle/
+
+# Model checkpoints and serialized arrays
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Audio/data archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.ogg
+*.wav
+*.flac
+*.mp3
+
+# Generated competition artifacts
+submission.csv
+oof_predictions*.csv
+fold_distribution.csv
+fold_metrics.csv
+per_class_auc*.csv
+source_auc.csv
+taxonomy_group_auc.csv
+calibration.csv
+hard_negatives.csv
+pseudo_labels.csv
+training_history.png
+
+# Logs / temporary files
+*.log
+logs/
+tmp/
+temp/

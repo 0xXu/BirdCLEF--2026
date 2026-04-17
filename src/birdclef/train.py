@@ -11,10 +11,16 @@ from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
 
 from birdclef.config import CFG
-from birdclef.dataset import BirdCLEFDataset, collate_fn, make_weighted_sampler
+from birdclef.dataset import BirdCLEFDataset, collate_fn
 from birdclef.deps import require_dependencies, roc_auc_score, tqdm
 from birdclef.model import BirdCLEFModel
 from birdclef.deps import plt
+from birdclef.pseudo import fold_safe_pseudo_subset, load_pseudo_training_frame
+from birdclef.sampling import (
+    attach_hard_negative_metadata,
+    compute_positive_class_weights,
+    make_weighted_sampler,
+)
 from birdclef.utils import load_species_ids
 from birdclef.validation import (
     calculate_group_auc,
@@ -24,13 +30,32 @@ from birdclef.validation import (
 )
 
 
-def mixup(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4) -> tuple[torch.Tensor, torch.Tensor]:
+def mixup(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    sample_weight: torch.Tensor,
+    loss_weight: torch.Tensor,
+    alpha: float = 0.4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     lam = np.random.beta(alpha, alpha)
     idx = torch.randperm(x.size(0), device=x.device)
-    return lam * x + (1 - lam) * x[idx], lam * y + (1 - lam) * y[idx]
+    mixed_x = lam * x + (1 - lam) * x[idx]
+    mixed_y = lam * y + (1 - lam) * y[idx]
+    mixed_mask = mask * mask[idx]
+    mixed_sample_weight = lam * sample_weight + (1 - lam) * sample_weight[idx]
+    mixed_loss_weight = lam * loss_weight + (1 - lam) * loss_weight[idx]
+    return mixed_x, mixed_y, mixed_mask, mixed_sample_weight, mixed_loss_weight
 
 
-def cutmix(x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+def cutmix(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    sample_weight: torch.Tensor,
+    loss_weight: torch.Tensor,
+    alpha: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     lam = np.random.beta(alpha, alpha)
     idx = torch.randperm(x.size(0), device=x.device)
     _, _, height, width = x.shape
@@ -44,7 +69,11 @@ def cutmix(x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0) -> tuple[torch.
     mixed = x.clone()
     mixed[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
     lam_act = 1 - (x2 - x1) * (y2 - y1) / (width * height)
-    return mixed, lam_act * y + (1 - lam_act) * y[idx]
+    mixed_y = lam_act * y + (1 - lam_act) * y[idx]
+    mixed_mask = mask * mask[idx]
+    mixed_sample_weight = lam_act * sample_weight + (1 - lam_act) * sample_weight[idx]
+    mixed_loss_weight = lam_act * loss_weight + (1 - lam_act) * loss_weight[idx]
+    return mixed, mixed_y, mixed_mask, mixed_sample_weight, mixed_loss_weight
 
 
 class FocalBCELoss(nn.Module):
@@ -54,20 +83,46 @@ class FocalBCELoss(nn.Module):
         focal_w: float = 0.7,
         bce_w: float = 0.3,
         smoothing: float = 0.05,
+        positive_class_weights: torch.Tensor | None = None,
     ):
         super().__init__()
         self.gamma = gamma
         self.focal_w = focal_w
         self.bce_w = bce_w
         self.smoothing = smoothing
+        if positive_class_weights is not None:
+            self.register_buffer("positive_class_weights", positive_class_weights.float())
+        else:
+            self.positive_class_weights = None
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        sample_weight: torch.Tensor | None = None,
+        loss_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         targets_s = targets * (1 - self.smoothing) + self.smoothing / logits.shape[-1]
         bce_raw = F.binary_cross_entropy_with_logits(logits, targets_s, reduction="none")
         probs = torch.sigmoid(logits)
         p_t = probs * targets_s + (1 - probs) * (1 - targets_s)
-        focal = ((1 - p_t) ** self.gamma * bce_raw).mean()
-        bce = bce_raw.mean()
+        focal_raw = (1 - p_t) ** self.gamma * bce_raw
+
+        element_weight = torch.ones_like(bce_raw)
+        if mask is not None:
+            element_weight = element_weight * mask
+        if self.positive_class_weights is not None:
+            pos_weights = self.positive_class_weights.to(logits.device).view(1, -1)
+            element_weight = element_weight * (1.0 + (pos_weights - 1.0) * targets_s)
+        if loss_weight is not None:
+            element_weight = element_weight * loss_weight
+        if sample_weight is not None:
+            element_weight = element_weight * sample_weight.view(-1, 1)
+
+        denom = element_weight.sum().clamp_min(1.0)
+        focal = (focal_raw * element_weight).sum() / denom
+        bce = (bce_raw * element_weight).sum() / denom
         return self.focal_w * focal + self.bce_w * bce
 
 
@@ -121,16 +176,23 @@ def train_one_epoch(
     for step, batch in pbar:
         inputs = batch["melspec"].to(cfg.device)
         targets = batch["target"].to(cfg.device)
+        masks = batch["target_mask"].to(cfg.device)
+        sample_weights = batch["sample_weight"].to(cfg.device)
+        loss_weights = batch["loss_weight"].to(cfg.device)
 
         aug_roll = random.random()
         if aug_roll < cfg.mixup_prob:
-            inputs, targets = mixup(inputs, targets, cfg.mixup_alpha)
+            inputs, targets, masks, sample_weights, loss_weights = mixup(
+                inputs, targets, masks, sample_weights, loss_weights, cfg.mixup_alpha
+            )
         elif aug_roll < cfg.mixup_prob + cfg.cutmix_prob:
-            inputs, targets = cutmix(inputs, targets)
+            inputs, targets, masks, sample_weights, loss_weights = cutmix(
+                inputs, targets, masks, sample_weights, loss_weights
+            )
 
         optimizer.zero_grad(set_to_none=True)
         outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        loss = criterion(outputs, targets, masks, sample_weights, loss_weights)
         loss.backward()
         optimizer.step()
 
@@ -167,8 +229,11 @@ def validate(
         for batch in tqdm(loader, desc="Validation"):
             inputs = batch["melspec"].to(cfg.device)
             targets = batch["target"].to(cfg.device)
+            masks = batch["target_mask"].to(cfg.device)
+            sample_weights = batch["sample_weight"].to(cfg.device)
+            loss_weights = batch["loss_weight"].to(cfg.device)
             outputs = model(inputs)
-            losses.append(criterion(outputs, targets).item())
+            losses.append(criterion(outputs, targets, masks, sample_weights, loss_weights).item())
             auc_outputs.append(outputs.cpu().numpy())
             auc_targets.append(targets.cpu().numpy())
 
@@ -209,16 +274,11 @@ def plot_training_history(history: dict[int, dict[str, list[float]]], cfg: CFG) 
     print(f"Saved {out_path}")
 
 
-def run_training(df, cache: np.ndarray, cfg: CFG) -> dict[int, dict[str, list[float]]]:
+def run_training(df, cfg: CFG) -> dict[int, dict[str, list[float]]]:
     require_dependencies(("scikit-learn", roc_auc_score), ("matplotlib", plt))
-    criterion = FocalBCELoss(
-        gamma=cfg.focal_gamma,
-        focal_w=cfg.focal_weight,
-        bce_w=cfg.bce_weight,
-        smoothing=cfg.label_smoothing,
-    )
     species_ids = load_species_ids(cfg)
     folds = make_folds(df, cfg)
+    pseudo_df = load_pseudo_training_frame(cfg)
     fold_summary = summarize_fold_distribution(df, folds, cfg)
     fold_summary_path = cfg.output_dir / "fold_distribution.csv"
     fold_summary.to_csv(fold_summary_path, index=False)
@@ -242,20 +302,35 @@ def run_training(df, cache: np.ndarray, cfg: CFG) -> dict[int, dict[str, list[fl
         val_idx = split.val_idx
         train_df_f = df.iloc[train_idx].reset_index(drop=True)
         val_df_f = df.iloc[val_idx].reset_index(drop=True)
-        train_cache_f = cache[train_idx]
-        val_cache_f = cache[val_idx]
+        fold_pseudo_df = fold_safe_pseudo_subset(pseudo_df, train_df_f, val_df_f)
+        if fold_pseudo_df is not None:
+            train_df_f = pd.concat([train_df_f, fold_pseudo_df], ignore_index=True, sort=False)
+            print(
+                f"Added pseudo rows to fold {fold}: pseudo={len(fold_pseudo_df)} "
+                f"train_total={len(train_df_f)}"
+            )
+        train_df_f = attach_hard_negative_metadata(train_df_f, cfg)
         print(
             f"Train={len(train_df_f)} Val={len(val_df_f)} "
             f"strategy={split.strategy} group={split.group_col}"
         )
 
-        train_ds = BirdCLEFDataset(train_df_f, train_cache_f, cfg, mode="train")
-        val_ds = BirdCLEFDataset(val_df_f, val_cache_f, cfg, mode="valid")
+        positive_class_weights = compute_positive_class_weights(train_df_f, species_ids, cfg).to(cfg.device)
+        criterion = FocalBCELoss(
+            gamma=cfg.focal_gamma,
+            focal_w=cfg.focal_weight,
+            bce_w=cfg.bce_weight,
+            smoothing=cfg.label_smoothing,
+            positive_class_weights=positive_class_weights,
+        )
+
+        train_ds = BirdCLEFDataset(train_df_f, cfg, mode="train")
+        val_ds = BirdCLEFDataset(val_df_f, cfg, mode="valid")
 
         sampler = None
         shuffle_train = True
         if cfg.use_rating_weight:
-            sampler = make_weighted_sampler(train_df_f.fillna({"rating": 0.0}))
+            sampler = make_weighted_sampler(train_df_f.fillna({"rating": 0.0}), cfg, species_ids)
             shuffle_train = False
 
         train_loader = DataLoader(

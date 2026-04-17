@@ -5,6 +5,7 @@ description = "Local-first BirdCLEF competition pipeline extracted from a notebo
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "h5py",
   "librosa",
   "llvmlite==0.45.1",
   "matplotlib",

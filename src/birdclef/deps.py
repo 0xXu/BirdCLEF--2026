@@ -7,6 +7,11 @@ except ModuleNotFoundError:
     cv2 = None
 
 try:
+    import h5py
+except ModuleNotFoundError:
+    h5py = None
+
+try:
     import librosa
     import librosa.display
 except ModuleNotFoundError:
@@ -36,10 +41,8 @@ except ModuleNotFoundError:
 
 try:
     from sklearn.metrics import roc_auc_score
-    from sklearn.model_selection import StratifiedKFold
 except ModuleNotFoundError:
     roc_auc_score = None
-    StratifiedKFold = None
 
 try:
     from tqdm.auto import tqdm

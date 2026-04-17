@@ -6,6 +6,7 @@ from birdclef.audio import audio2logmel
 from birdclef.config import CFG
 from birdclef.deps import cv2, librosa, require_dependencies, tqdm
 from birdclef.model import BirdCLEFModel
+from birdclef.postprocess import load_calibration_table, postprocess_soundscape_predictions
 from birdclef.utils import load_species_ids
 
 
@@ -33,22 +34,29 @@ def predict_soundscapes_tta(cfg: CFG) -> pd.DataFrame:
         raise FileNotFoundError("No model_fold*.pth checkpoints found. Run training first.")
 
     models = []
+    model_weights = []
     for ckpt_path in ckpt_files:
-        model = BirdCLEFModel(cfg).to(cfg.device)
+        model = BirdCLEFModel(cfg, load_backbone_weights=False).to(cfg.device)
         ckpt = torch.load(ckpt_path, map_location=cfg.device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         model.eval()
         models.append(model)
-        print(f"Loaded {ckpt_path.name} val_auc={ckpt.get('val_auc', 0.0):.4f}")
+        val_auc = float(ckpt.get("val_auc", 0.0))
+        model_weights.append(max(val_auc, 1e-6))
+        print(f"Loaded {ckpt_path.name} val_auc={val_auc:.4f}")
+    model_weights_arr = np.array(model_weights, dtype=np.float32)
+    model_weights_arr = model_weights_arr / model_weights_arr.sum()
+    calibration = load_calibration_table(cfg)
+    if calibration is not None:
+        print(f"Loaded calibration table {cfg.resolved_calibration_path}")
 
     test_oggs = sorted(cfg.test_sc_dir.glob("*.ogg"))
     if not test_oggs:
-        fallback_dir = cfg.train_datadir.parent / "train_soundscapes"
-        test_oggs = sorted(fallback_dir.glob("*.ogg"))[:8]
+        raise FileNotFoundError(f"No test soundscapes found in {cfg.test_sc_dir}")
 
     all_row_ids = []
     all_preds = []
-    n_crops = cfg.tta_crops if cfg.tta_enabled else 1
+    n_crops = max(1, cfg.tta_crops)
     print(f"Running inference on {len(test_oggs)} soundscape(s) with {n_crops} crop(s)")
 
     for ogg_path in tqdm(test_oggs, desc="TTA Inference"):
@@ -86,14 +94,20 @@ def predict_soundscapes_tta(cfg: CFG) -> pd.DataFrame:
                 x = audio_to_tensor(seg, cfg).to(cfg.device)
                 fold_probs = []
                 with torch.no_grad():
-                    for model in models:
-                        fold_probs.append(torch.sigmoid(model(x)).cpu().numpy()[0])
-                crop_probs.append(np.mean(fold_probs, axis=0))
+                    for model, weight in zip(models, model_weights_arr):
+                        fold_probs.append(torch.sigmoid(model(x)).cpu().numpy()[0] * float(weight))
+                crop_probs.append(np.sum(fold_probs, axis=0))
 
             seg_preds.append(np.mean(crop_probs, axis=0))
 
         all_row_ids.extend(row_ids)
-        all_preds.append(np.array(seg_preds))
+        processed = postprocess_soundscape_predictions(
+            np.array(seg_preds, dtype=np.float32),
+            species_ids,
+            cfg,
+            calibration=calibration,
+        )
+        all_preds.append(processed)
 
     preds_arr = np.concatenate(all_preds)
     sample_sub = pd.read_csv(cfg.submission_csv)

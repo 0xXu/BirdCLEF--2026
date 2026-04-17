@@ -84,7 +84,7 @@ def save_species_world_map(train_df, species_counts, cfg: CFG, top_n: int = 20, 
             ax.grid(color="#21262d", linewidth=0.4, linestyle="--", alpha=0.5)
             map_drawn = True
         except Exception as exc:
-            print(f"Geopandas world plot failed ({exc}), falling back to scatter.")
+            print(f"Geopandas world plot failed ({exc}); using scatter plot.")
 
     if not map_drawn:
         ax = fig.add_subplot(1, 1, 1)
