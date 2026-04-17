@@ -17,8 +17,12 @@ dependencies = [
   "scikit-learn",
   "soundfile",
   "timm",
-  "torch==2.2.2",
-  "torchaudio==2.2.2",
+  "torch==2.2.2; sys_platform == 'darwin'",
+  "torch==2.2.2+cu121; sys_platform == 'win32' or sys_platform == 'linux'",
+  "torchaudio==2.2.2; sys_platform == 'darwin'",
+  "torchaudio==2.2.2+cu121; sys_platform == 'win32' or sys_platform == 'linux'",
+  "torchvision==0.17.2; sys_platform == 'darwin'",
+  "torchvision==0.17.2+cu121; sys_platform == 'win32' or sys_platform == 'linux'",
   "tqdm",
 ]
 
@@ -34,3 +38,19 @@ packages = ["src/birdclef"]
 
 [tool.uv]
 package = true
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu121", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
+torchaudio = [
+  { index = "pytorch-cu121", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cu121", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
