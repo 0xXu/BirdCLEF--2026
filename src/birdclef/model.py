@@ -19,7 +19,7 @@ class GeM(nn.Module):
 
 
 class BirdCLEFModel(nn.Module):
-    def __init__(self, cfg: CFG):
+    def __init__(self, cfg: CFG, load_backbone_weights: bool = True):
         super().__init__()
         require_dependencies(("timm", timm))
         self.cfg = cfg
@@ -27,14 +27,15 @@ class BirdCLEFModel(nn.Module):
 
         self.backbone = timm.create_model(
             cfg.model_name,
-            pretrained=not cfg.pretrained_path.exists(),
+            pretrained=False,
             in_chans=3,
             num_classes=0,
             global_pool="",
             drop_rate=0.0,
             drop_path_rate=0.0,
         )
-        self._load_local_backbone_weights(cfg.pretrained_path)
+        if load_backbone_weights:
+            self._load_local_backbone_weights(cfg.pretrained_path)
         self._convert_first_conv_to_single_channel()
 
         with torch.no_grad():
@@ -60,8 +61,10 @@ class BirdCLEFModel(nn.Module):
 
     def _load_local_backbone_weights(self, weight_dir: Path) -> None:
         if not weight_dir.exists():
-            print(f"Backbone local weights not found at {weight_dir}, falling back to timm pretrained weights.")
-            return
+            raise FileNotFoundError(
+                f"Backbone local weights not found at {weight_dir}. "
+                "Place the timm weights under cfg.pretrained_path before training."
+            )
 
         weight_file = None
         for ext in ("*.safetensors", "*.pth", "*.bin", "*.pt"):
@@ -70,8 +73,7 @@ class BirdCLEFModel(nn.Module):
                 weight_file = found[0]
                 break
         if weight_file is None:
-            print(f"No backbone weight file found in {weight_dir}, falling back to timm pretrained weights.")
-            return
+            raise FileNotFoundError(f"No backbone weight file found in {weight_dir}")
 
         print(f"Loading backbone weights from {weight_file.name}")
         if weight_file.suffix == ".safetensors":
