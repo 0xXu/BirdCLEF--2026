@@ -51,13 +51,38 @@ class CFG:
     pseudo_teacher_tta_crops: int = 3
     pseudo_batch_size: int = 16
     pseudo_max_files: int | None = None
-    soundscape_smooth_kernel: tuple[float, ...] = (0.1, 0.2, 0.4, 0.2, 0.1)
-    soundscape_max_boost: float = 0.12
-    soundscape_boost_threshold: float = 0.20
-    soundscape_boost_power: float = 1.0
-    calibration_path: Path | None = None
-    calibration_blend: float = 1.0
-    calibration_min_positives: int = 2
+    postprocess_params_path: Path | None = None
+    per_class_thresholds_path: Path | None = None
+    postprocess_file_level_top_k: int = 2
+    postprocess_rank_power: float = 0.4
+    postprocess_delta_alpha: float = 0.15
+    postprocess_adaptive_delta: bool = True
+    postprocess_threshold_sharpening: bool = True
+    postprocess_taxon_temperature: bool = True
+    postprocess_taxon_temperatures: dict[str, float] = field(
+        default_factory=lambda: {
+            "Aves": 1.10,
+            "Insecta": 0.95,
+            "Amphibia": 0.95,
+            "Reptilia": 0.95,
+            "Mammalia": 0.95,
+        }
+    )
+    postprocess_file_top_k_grid: tuple[int, ...] = (0, 1, 2, 3)
+    postprocess_rank_power_grid: tuple[float, ...] = (0.0, 0.4, 0.5)
+    postprocess_delta_alpha_grid: tuple[float, ...] = (0.0, 0.15, 0.20)
+    postprocess_threshold_grid: tuple[float, ...] = (
+        0.25,
+        0.30,
+        0.35,
+        0.40,
+        0.45,
+        0.50,
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+    )
     hard_negative_path: Path | None = None
     hard_negative_threshold: float = 0.35
     hard_negative_topk: int = 5
@@ -135,10 +160,16 @@ class CFG:
         return self.output_dir / "pseudo_labels.csv"
 
     @property
-    def resolved_calibration_path(self) -> Path:
-        if self.calibration_path is not None:
-            return self.calibration_path
-        return self.output_dir / "calibration.csv"
+    def resolved_postprocess_params_path(self) -> Path:
+        if self.postprocess_params_path is not None:
+            return self.postprocess_params_path
+        return self.output_dir / "postprocess_params.json"
+
+    @property
+    def resolved_per_class_thresholds_path(self) -> Path:
+        if self.per_class_thresholds_path is not None:
+            return self.per_class_thresholds_path
+        return self.output_dir / "per_class_thresholds.csv"
 
     @property
     def resolved_hard_negative_path(self) -> Path:
@@ -153,6 +184,21 @@ def parse_folds(raw: str) -> list[int]:
 
 def parse_float_tuple(raw: str) -> tuple[float, ...]:
     return tuple(float(x) for x in raw.split(",") if x.strip())
+
+
+def parse_int_tuple(raw: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in raw.split(",") if x.strip())
+
+
+def parse_taxon_temperatures(raw: str) -> dict[str, float]:
+    out = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, value = item.split(":", 1)
+        out[key.strip()] = float(value)
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,12 +223,27 @@ def parse_args() -> argparse.Namespace:
         cmd.add_argument("--pseudo-mask-prob", type=float, default=0.10)
         cmd.add_argument("--pseudo-max-labels", type=int, default=5)
         cmd.add_argument("--pseudo-sampling-weight", type=float, default=0.40)
-        cmd.add_argument("--soundscape-smooth-kernel", type=str, default="0.1,0.2,0.4,0.2,0.1")
-        cmd.add_argument("--soundscape-max-boost", type=float, default=0.12)
-        cmd.add_argument("--soundscape-boost-threshold", type=float, default=0.20)
-        cmd.add_argument("--soundscape-boost-power", type=float, default=1.0)
-        cmd.add_argument("--calibration-path", type=Path, default=None)
-        cmd.add_argument("--calibration-blend", type=float, default=1.0)
+        cmd.add_argument("--postprocess-params-path", type=Path, default=None)
+        cmd.add_argument("--per-class-thresholds-path", type=Path, default=None)
+        cmd.add_argument("--postprocess-file-level-top-k", type=int, default=2)
+        cmd.add_argument("--postprocess-rank-power", type=float, default=0.4)
+        cmd.add_argument("--postprocess-delta-alpha", type=float, default=0.15)
+        cmd.add_argument("--disable-adaptive-delta", action="store_true")
+        cmd.add_argument("--disable-threshold-sharpening", action="store_true")
+        cmd.add_argument("--disable-taxon-temperature", action="store_true")
+        cmd.add_argument(
+            "--postprocess-taxon-temperatures",
+            type=str,
+            default="Aves:1.10,Insecta:0.95,Amphibia:0.95,Reptilia:0.95,Mammalia:0.95",
+        )
+        cmd.add_argument("--postprocess-file-top-k-grid", type=str, default="0,1,2,3")
+        cmd.add_argument("--postprocess-rank-power-grid", type=str, default="0.0,0.4,0.5")
+        cmd.add_argument("--postprocess-delta-alpha-grid", type=str, default="0.0,0.15,0.20")
+        cmd.add_argument(
+            "--postprocess-threshold-grid",
+            type=str,
+            default="0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70",
+        )
         cmd.add_argument("--hard-negative-path", type=Path, default=None)
         cmd.add_argument("--hard-negative-threshold", type=float, default=0.35)
         cmd.add_argument("--hard-negative-topk", type=int, default=5)
@@ -252,12 +313,19 @@ def build_cfg(args: argparse.Namespace) -> CFG:
     cfg.pseudo_mask_prob = args.pseudo_mask_prob
     cfg.pseudo_max_labels = args.pseudo_max_labels
     cfg.pseudo_sampling_weight = args.pseudo_sampling_weight
-    cfg.soundscape_smooth_kernel = parse_float_tuple(args.soundscape_smooth_kernel)
-    cfg.soundscape_max_boost = args.soundscape_max_boost
-    cfg.soundscape_boost_threshold = args.soundscape_boost_threshold
-    cfg.soundscape_boost_power = args.soundscape_boost_power
-    cfg.calibration_path = args.calibration_path
-    cfg.calibration_blend = args.calibration_blend
+    cfg.postprocess_params_path = args.postprocess_params_path
+    cfg.per_class_thresholds_path = args.per_class_thresholds_path
+    cfg.postprocess_file_level_top_k = args.postprocess_file_level_top_k
+    cfg.postprocess_rank_power = args.postprocess_rank_power
+    cfg.postprocess_delta_alpha = args.postprocess_delta_alpha
+    cfg.postprocess_adaptive_delta = not args.disable_adaptive_delta
+    cfg.postprocess_threshold_sharpening = not args.disable_threshold_sharpening
+    cfg.postprocess_taxon_temperature = not args.disable_taxon_temperature
+    cfg.postprocess_taxon_temperatures = parse_taxon_temperatures(args.postprocess_taxon_temperatures)
+    cfg.postprocess_file_top_k_grid = parse_int_tuple(args.postprocess_file_top_k_grid)
+    cfg.postprocess_rank_power_grid = parse_float_tuple(args.postprocess_rank_power_grid)
+    cfg.postprocess_delta_alpha_grid = parse_float_tuple(args.postprocess_delta_alpha_grid)
+    cfg.postprocess_threshold_grid = parse_float_tuple(args.postprocess_threshold_grid)
     cfg.hard_negative_path = args.hard_negative_path
     cfg.hard_negative_threshold = args.hard_negative_threshold
     cfg.hard_negative_topk = args.hard_negative_topk

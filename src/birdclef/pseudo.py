@@ -8,7 +8,12 @@ from birdclef.audio import audio2logmel, load_audio_mono, logmel_to_shape
 from birdclef.config import CFG
 from birdclef.infer import discover_checkpoints
 from birdclef.model import BirdCLEFModel
-from birdclef.postprocess import load_calibration_table, postprocess_soundscape_predictions
+from birdclef.postprocess import (
+    load_per_class_thresholds,
+    load_postprocess_params,
+    load_taxon_temperature_vector,
+    postprocess_soundscape_predictions,
+)
 from birdclef.utils import load_species_ids
 
 
@@ -159,9 +164,13 @@ def _build_pseudo_rows(
 def generate_pseudo_labels(cfg: CFG) -> pd.DataFrame:
     species_ids = load_species_ids(cfg)
     models, weights = _load_teacher_models(cfg)
-    calibration = load_calibration_table(cfg)
-    if calibration is not None:
-        print(f"Loaded calibration table {cfg.resolved_calibration_path}")
+    postprocess_params = load_postprocess_params(cfg)
+    thresholds = load_per_class_thresholds(cfg, species_ids)
+    taxon_temperature_vector = load_taxon_temperature_vector(cfg, species_ids, postprocess_params)
+    if cfg.resolved_postprocess_params_path.exists():
+        print(f"Loaded postprocess params {cfg.resolved_postprocess_params_path}")
+    if thresholds is not None:
+        print(f"Loaded per-class thresholds {cfg.resolved_per_class_thresholds_path}")
     sc_dir = cfg.train_datadir.parent / "train_soundscapes"
     soundscapes = sorted(sc_dir.glob("*.ogg"))
     if cfg.pseudo_max_files is not None:
@@ -177,7 +186,14 @@ def generate_pseudo_labels(cfg: CFG) -> pd.DataFrame:
     for idx, ogg_path in enumerate(soundscapes, start=1):
         audio = load_audio_mono(ogg_path, cfg)
         preds, frames = _predict_audio_frames(audio, models, weights, cfg)
-        preds = postprocess_soundscape_predictions(preds, species_ids, cfg, calibration=calibration)
+        preds = postprocess_soundscape_predictions(
+            preds,
+            species_ids,
+            cfg,
+            postprocess_params=postprocess_params,
+            thresholds=thresholds,
+            taxon_temperature_vector=taxon_temperature_vector,
+        )
         file_rows = _build_pseudo_rows(ogg_path, preds, frames, species_ids, cfg)
         rows.extend(file_rows)
         if idx % 25 == 0 or idx == len(soundscapes):

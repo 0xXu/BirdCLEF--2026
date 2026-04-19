@@ -450,9 +450,9 @@ def save_oof_metrics(oof_df: pd.DataFrame, cfg: CFG) -> pd.DataFrame:
         )
         taxonomy_auc.to_csv(out_dir / "taxonomy_group_auc.csv", index=False)
 
-    from birdclef.postprocess import fit_calibration_table_from_oof
+    from birdclef.postprocess import fit_pantanal_postprocess_from_oof
     from birdclef.sampling import build_hard_negative_table_from_oof
 
-    fit_calibration_table_from_oof(oof_df, species_ids, cfg)
+    fit_pantanal_postprocess_from_oof(oof_df, species_ids, cfg)
     build_hard_negative_table_from_oof(oof_df, species_ids, cfg)
     return per_class

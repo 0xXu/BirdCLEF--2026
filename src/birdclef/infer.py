@@ -6,7 +6,12 @@ from birdclef.audio import audio2logmel
 from birdclef.config import CFG
 from birdclef.deps import cv2, librosa, require_dependencies, tqdm
 from birdclef.model import BirdCLEFModel
-from birdclef.postprocess import load_calibration_table, postprocess_soundscape_predictions
+from birdclef.postprocess import (
+    load_per_class_thresholds,
+    load_postprocess_params,
+    load_taxon_temperature_vector,
+    postprocess_soundscape_predictions,
+)
 from birdclef.utils import load_species_ids
 
 
@@ -46,9 +51,13 @@ def predict_soundscapes_tta(cfg: CFG) -> pd.DataFrame:
         print(f"Loaded {ckpt_path.name} val_auc={val_auc:.4f}")
     model_weights_arr = np.array(model_weights, dtype=np.float32)
     model_weights_arr = model_weights_arr / model_weights_arr.sum()
-    calibration = load_calibration_table(cfg)
-    if calibration is not None:
-        print(f"Loaded calibration table {cfg.resolved_calibration_path}")
+    postprocess_params = load_postprocess_params(cfg)
+    thresholds = load_per_class_thresholds(cfg, species_ids)
+    taxon_temperature_vector = load_taxon_temperature_vector(cfg, species_ids, postprocess_params)
+    if cfg.resolved_postprocess_params_path.exists():
+        print(f"Loaded postprocess params {cfg.resolved_postprocess_params_path}")
+    if thresholds is not None:
+        print(f"Loaded per-class thresholds {cfg.resolved_per_class_thresholds_path}")
 
     test_oggs = sorted(cfg.test_sc_dir.glob("*.ogg"))
     if not test_oggs:
@@ -105,7 +114,9 @@ def predict_soundscapes_tta(cfg: CFG) -> pd.DataFrame:
             np.array(seg_preds, dtype=np.float32),
             species_ids,
             cfg,
-            calibration=calibration,
+            postprocess_params=postprocess_params,
+            thresholds=thresholds,
+            taxon_temperature_vector=taxon_temperature_vector,
         )
         all_preds.append(processed)
 

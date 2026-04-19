@@ -7,8 +7,8 @@
 - 验证：默认 multi-label stratified group split，按 `audio_id` 分组防泄漏。
 - 训练：EfficientNet + GeM，mixup/cutmix，masked BCE/Focal，rare-class 与 taxonomy-aware sampler。
 - 半监督：teacher ensemble -> soundscape pseudo labels -> student training。
-- 后处理：temporal smoothing、soundscape-level max boost、per-class calibration。
-- 产物：checkpoint、OOF、AUC 报表、calibration、hard negatives、pseudo labels、submission。
+- 后处理：Pantanal-style taxon temperature、file-level top-k scaling、rank-aware scaling、adaptive delta smoothing、per-class threshold sharpening。
+- 产物：checkpoint、OOF、AUC 报表、postprocess params、per-class thresholds、hard negatives、pseudo labels、submission。
 
 ## 环境与数据
 
@@ -72,10 +72,13 @@ per_class_auc.csv
 per_class_auc_rank.csv
 source_auc.csv
 taxonomy_group_auc.csv
-calibration.csv
+postprocess_params.json
+per_class_thresholds.csv
 hard_negatives.csv
 training_history.png
 ```
+
+`postprocess_params.json` 与 `per_class_thresholds.csv` 会由 OOF 自动拟合。分批训练 fold 后，先执行 `merge-oof` 重新生成这两个文件。
 
 ## 3. 生成 Pseudo Labels
 
@@ -87,19 +90,15 @@ uv run birdclef pseudo \
   --pseudo-batch-size 16 \
   --pseudo-min-primary-prob 0.50 \
   --pseudo-label-prob 0.35 \
-  --pseudo-mask-prob 0.10 \
-  --calibration-path kaggle/working_teacher_v1/calibration.csv \
-  --soundscape-smooth-kernel 0.1,0.2,0.4,0.2,0.1 \
-  --soundscape-max-boost 0.12 \
-  --soundscape-boost-threshold 0.20
+  --pseudo-mask-prob 0.10
 ```
 
 pseudo 生成逻辑：
 
 - checkpoint 按 fold `val_auc` 加权 ensemble
 - 每个 5s frame 使用 TTA crops
-- 应用 temporal smoothing 与 soundscape-level max boost
-- 如存在 `calibration.csv`，先做 per-class calibration
+- 应用与 inference 一致的 Pantanal-style soundscape 后处理
+- 优先加载 teacher 目录下的 `postprocess_params.json` 与 `per_class_thresholds.csv`
 - 输出完整 `pseudo_<class>` soft targets
 
 ## 4. 构建 Student Cache
@@ -118,7 +117,6 @@ uv run birdclef train \
   --output-dir kaggle/working_student_v1 \
   --pseudo-path kaggle/working_teacher_v1/pseudo_labels.csv \
   --hard-negative-path kaggle/working_teacher_v1/hard_negatives.csv \
-  --calibration-path kaggle/working_teacher_v1/calibration.csv \
   --folds 0,1,2,3,4 \
   --epochs 6 \
   --batch-size 8 \
@@ -129,7 +127,7 @@ uv run birdclef train \
   --hard-negative-threshold 0.35
 ```
 
-Student 会生成自己的 `calibration.csv` 和 `hard_negatives.csv`，最终推理优先使用 student 产物。
+Student 会生成自己的 `postprocess_params.json`、`per_class_thresholds.csv` 和 `hard_negatives.csv`，最终推理优先使用 student 产物。
 
 ## 6. Inference
 
@@ -138,11 +136,7 @@ Student 会生成自己的 `calibration.csv` 和 `hard_negatives.csv`，最终�
 ```bash
 uv run birdclef infer \
   --output-dir kaggle/working_student_v1 \
-  --tta-crops 3 \
-  --calibration-path kaggle/working_student_v1/calibration.csv \
-  --soundscape-smooth-kernel 0.1,0.2,0.4,0.2,0.1 \
-  --soundscape-max-boost 0.12 \
-  --soundscape-boost-threshold 0.20
+  --tta-crops 3
 ```
 
 输出：
@@ -176,6 +170,19 @@ uv run birdclef train --cv-strategy source_holdout --folds 0
 uv run birdclef merge-oof --output-dir kaggle/working_teacher_v1
 ```
 
+`merge-oof` 会重新生成：
+
+```text
+oof_predictions.csv
+per_class_auc.csv
+per_class_auc_rank.csv
+source_auc.csv
+taxonomy_group_auc.csv
+postprocess_params.json
+per_class_thresholds.csv
+hard_negatives.csv
+```
+
 ## 目录约定
 
 ```text
@@ -190,4 +197,4 @@ kaggle/working_student_v1/                       # student 输出
 - Apple Silicon：使用 `--num-workers 0`，`--batch-size 8`；内存紧张时降到 `4`。
 - Cache：优先 `--cache-workers 4`，磁盘和 CPU 都有余量再提高。
 - Pseudo 阈值：默认 `0.50 / 0.35`；伪标签过少时降到 `0.40 / 0.30`。
-- 最终提交：使用 student checkpoint 和 student `calibration.csv`。
+- 最终提交：使用 student checkpoint、student `postprocess_params.json` 和 student `per_class_thresholds.csv`。
