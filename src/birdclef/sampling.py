@@ -113,7 +113,12 @@ def make_weighted_sampler(df: pd.DataFrame, cfg: CFG, species_ids: list[str]) ->
 
     weights = df["rating"].apply(score_rating).to_numpy(dtype=np.float32)
     sources = df["source"].astype(str) if "source" in df.columns else pd.Series("train_audio", index=df.index)
-    weights *= np.where(sources.eq("soundscape").values, cfg.soundscape_sampling_weight, 1.0).astype(np.float32)
+    soundscape_like = sources.str.contains("soundscape", na=False)
+    weights *= np.where(soundscape_like.values, cfg.soundscape_sampling_weight, 1.0).astype(np.float32)
+
+    if "row_weight" in df.columns:
+        row_weight = pd.to_numeric(df["row_weight"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float32)
+        weights *= row_weight
 
     if "pseudo_weight" in df.columns:
         pseudo_weight = pd.to_numeric(df["pseudo_weight"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float32)

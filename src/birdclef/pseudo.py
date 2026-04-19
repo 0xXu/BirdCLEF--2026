@@ -129,14 +129,33 @@ def _build_pseudo_rows(
     for frame_idx, ((start_sec, end_sec), probs) in enumerate(zip(frames, preds)):
         top_idx = int(np.argmax(probs))
         primary_prob = float(probs[top_idx])
-        if primary_prob < cfg.pseudo_min_primary_prob:
+        pseudo_type = None
+        labels: list[str] = []
+        hard_negative_labels: list[str] = []
+        pseudo_weight = cfg.pseudo_sampling_weight
+
+        if primary_prob >= cfg.pseudo_min_primary_prob:
+            pseudo_type = "positive"
+            selected = np.where(probs >= cfg.pseudo_label_prob)[0].tolist()
+            if top_idx not in selected:
+                selected.insert(0, top_idx)
+            selected = sorted(selected, key=lambda idx: float(probs[idx]), reverse=True)[
+                : cfg.pseudo_max_labels
+            ]
+            labels = [species_ids[idx] for idx in selected]
+        elif cfg.pseudo_include_hard_negatives and primary_prob >= cfg.pseudo_hard_negative_min_prob:
+            pseudo_type = "hard_negative"
+            hard_idx = np.argsort(probs)[::-1][: cfg.pseudo_hard_negative_max_labels]
+            hard_negative_labels = [
+                species_ids[int(idx)] for idx in hard_idx if float(probs[int(idx)]) > 0.0
+            ]
+            pseudo_weight = cfg.pseudo_hard_negative_weight
+        elif cfg.pseudo_include_background and primary_prob <= cfg.pseudo_background_max_prob:
+            pseudo_type = "background"
+            pseudo_weight = cfg.pseudo_background_weight
+        else:
             continue
 
-        selected = np.where(probs >= cfg.pseudo_label_prob)[0].tolist()
-        if top_idx not in selected:
-            selected.insert(0, top_idx)
-        selected = sorted(selected, key=lambda idx: float(probs[idx]), reverse=True)[: cfg.pseudo_max_labels]
-        labels = [species_ids[idx] for idx in selected]
         row_id = f"{ogg_path.stem}_{int(end_sec)}"
         row = {
             "filename": ogg_path.name,
@@ -144,16 +163,19 @@ def _build_pseudo_rows(
             "filepath": str(ogg_path),
             "row_id": row_id,
             "source": "pseudo_soundscape",
-            "primary_label": labels[0],
-            "secondary_labels": str(labels[1:]),
+            "primary_label": labels[0] if labels else cfg.soundscape_background_label,
+            "secondary_labels": str(labels[1:]) if labels else "[]",
             "all_labels": str(labels),
+            "pseudo_type": pseudo_type,
+            "hard_negative_labels": str(hard_negative_labels),
             "offset": max(0.0, (start_sec + end_sec) / 2.0 - cfg.target_duration / 2.0),
             "start_sec": start_sec,
             "end_sec": end_sec,
-            "rating": 5.0,
+            "rating": 5.0 if labels else 0.0,
+            "is_background": 0 if labels else 1,
             "pseudo_primary_prob": primary_prob,
             "pseudo_n_labels": len(labels),
-            "pseudo_weight": cfg.pseudo_sampling_weight,
+            "pseudo_weight": pseudo_weight,
             **meta,
         }
         row.update({col: float(prob) for col, prob in zip(pred_cols, probs)})
@@ -224,17 +246,47 @@ def load_pseudo_training_frame(cfg: CFG) -> pd.DataFrame | None:
     if pseudo_df.empty:
         print(f"Pseudo label file is empty: {path}")
         return None
-    pseudo_df = pseudo_df[pseudo_df["pseudo_primary_prob"] >= cfg.pseudo_min_primary_prob].copy()
+
+    if "pseudo_type" not in pseudo_df.columns:
+        pseudo_df["pseudo_type"] = "positive"
+
+    if "pseudo_primary_prob" not in pseudo_df.columns:
+        pseudo_df["pseudo_primary_prob"] = 0.0
+    else:
+        pseudo_df["pseudo_primary_prob"] = pd.to_numeric(
+            pseudo_df["pseudo_primary_prob"], errors="coerce"
+        ).fillna(0.0)
+    pseudo_type = pseudo_df["pseudo_type"].astype(str)
+    positive_mask = pseudo_type.eq("positive") & (pseudo_df["pseudo_primary_prob"] >= cfg.pseudo_min_primary_prob)
+    hard_mask = (
+        pseudo_type.eq("hard_negative")
+        & cfg.pseudo_include_hard_negatives
+        & (pseudo_df["pseudo_primary_prob"] >= cfg.pseudo_hard_negative_min_prob)
+        & (pseudo_df["pseudo_primary_prob"] < cfg.pseudo_min_primary_prob)
+    )
+    background_mask = (
+        pseudo_type.eq("background")
+        & cfg.pseudo_include_background
+        & (pseudo_df["pseudo_primary_prob"] <= cfg.pseudo_background_max_prob)
+    )
+    pseudo_df = pseudo_df[positive_mask | hard_mask | background_mask].copy()
     if pseudo_df.empty:
         print("No pseudo rows left after confidence filtering.")
         return None
 
     pseudo_df["source"] = "pseudo_soundscape"
     pseudo_df["rating"] = pseudo_df.get("rating", 5.0)
-    pseudo_df["pseudo_weight"] = cfg.pseudo_sampling_weight
+    pseudo_df.loc[pseudo_df["pseudo_type"].astype(str).eq("positive"), "pseudo_weight"] = cfg.pseudo_sampling_weight
+    pseudo_df.loc[pseudo_df["pseudo_type"].astype(str).eq("hard_negative"), "pseudo_weight"] = (
+        cfg.pseudo_hard_negative_weight
+    )
+    pseudo_df.loc[pseudo_df["pseudo_type"].astype(str).eq("background"), "pseudo_weight"] = (
+        cfg.pseudo_background_weight
+    )
+    type_counts = pseudo_df["pseudo_type"].astype(str).value_counts().to_dict()
     print(
         f"Loaded pseudo rows from {path}: rows={len(pseudo_df)} "
-        f"mean_conf={pseudo_df['pseudo_primary_prob'].mean():.4f}"
+        f"mean_conf={pseudo_df['pseudo_primary_prob'].mean():.4f} types={type_counts}"
     )
     return pseudo_df.reset_index(drop=True)
 

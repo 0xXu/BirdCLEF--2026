@@ -1,4 +1,5 @@
 import ast
+import math
 import random
 import re
 from pathlib import Path
@@ -11,6 +12,7 @@ from torch.utils.data.dataloader import default_collate
 
 from birdclef.audio import LogMelExtractor, WaveformStore, logmel_to_shape
 from birdclef.config import CFG
+from birdclef.deps import sf
 from birdclef.utils import load_species_ids
 from birdclef.validation import parse_label_list
 
@@ -66,6 +68,8 @@ def build_train_df(cfg: CFG) -> pd.DataFrame:
     train_df["soundscape_site"] = np.nan
     train_df["soundscape_date"] = np.nan
     train_df["soundscape_hour"] = np.nan
+    train_df["row_weight"] = 1.0
+    train_df["is_background"] = 0
 
     sc_labels_df = pd.read_csv(cfg.sc_labels_csv)
 
@@ -90,6 +94,9 @@ def build_train_df(cfg: CFG) -> pd.DataFrame:
     sc_dir = cfg.train_datadir.parent / "train_soundscapes"
     sc_rows = []
 
+    labels_by_window: dict[tuple[str, float, float], list[str]] = {}
+    labels_by_start: dict[tuple[str, float], list[str]] = {}
+    file_to_label_rows: dict[str, list[pd.Series]] = {}
     for _, row in sc_labels_df.iterrows():
         labels = [
             label.strip()
@@ -98,29 +105,116 @@ def build_train_df(cfg: CFG) -> pd.DataFrame:
         ]
         if not labels:
             continue
-        audio_path = sc_dir / row["filename"]
-        if not audio_path.exists():
-            continue
-        soundscape_meta = _parse_soundscape_filename(row["filename"])
-        end_sec = float(row.get("end_sec", row["start_sec"] + 5.0))
-        label_center = (float(row["start_sec"]) + end_sec) / 2.0
+        filename = str(row["filename"])
+        file_to_label_rows.setdefault(filename, []).append(row)
+        start_sec = float(row["start_sec"])
+        end_sec = float(row.get("end_sec", start_sec + cfg.soundscape_window_sec))
+        window_key = (filename, start_sec, end_sec)
+        start_key = (filename, start_sec)
+        for target in (labels_by_window.setdefault(window_key, []), labels_by_start.setdefault(start_key, [])):
+            for label in labels:
+                if label not in target:
+                    target.append(label)
+
+    def soundscape_duration(audio_path: Path, label_rows: list[pd.Series]) -> float:
+        if sf is not None:
+            try:
+                info = sf.info(str(audio_path))
+                if info.frames > 0 and info.samplerate > 0:
+                    return float(info.frames) / float(info.samplerate)
+            except Exception:
+                pass
+        max_label_end = 0.0
+        for label_row in label_rows:
+            start_sec = float(label_row["start_sec"])
+            max_label_end = max(
+                max_label_end,
+                float(label_row.get("end_sec", start_sec + cfg.soundscape_window_sec)),
+            )
+        rounded_label_end = math.ceil(max_label_end / cfg.soundscape_window_sec) * cfg.soundscape_window_sec
+        return max(cfg.soundscape_window_sec, rounded_label_end)
+
+    def append_soundscape_row(
+        *,
+        audio_path: Path,
+        filename: str,
+        start_sec: float,
+        end_sec: float,
+        labels: list[str],
+    ) -> None:
+        soundscape_meta = _parse_soundscape_filename(filename)
+        has_labels = len(labels) > 0
+        label_center = (start_sec + end_sec) / 2.0
         context_offset = max(0.0, label_center - cfg.target_duration / 2.0)
         sc_rows.append(
             {
-                "filename": row["filename"],
-                "audio_id": _audio_id_from_filename(row["filename"]),
+                "filename": filename,
+                "audio_id": _audio_id_from_filename(filename),
                 "filepath": str(audio_path),
-                "primary_label": labels[0],
-                "secondary_labels": str(labels[1:]) if len(labels) > 1 else "[]",
+                "row_id": f"{Path(filename).stem}_{int(round(end_sec))}",
+                "primary_label": labels[0] if has_labels else cfg.soundscape_background_label,
+                "secondary_labels": str(labels[1:]) if has_labels else "[]",
                 "all_labels": str(labels),
                 "source": "soundscape",
                 "offset": context_offset,
-                "start_sec": float(row["start_sec"]),
+                "start_sec": start_sec,
                 "end_sec": end_sec,
-                "rating": 5.0,
+                "rating": 5.0 if has_labels else 0.0,
+                "row_weight": (
+                    cfg.soundscape_positive_weight if has_labels else cfg.soundscape_background_weight
+                ),
+                "is_background": 0 if has_labels else 1,
                 **soundscape_meta,
             }
         )
+
+    if cfg.soundscape_full_windows:
+        if cfg.soundscape_include_unlabeled_files:
+            soundscape_paths = sorted(sc_dir.glob("*.ogg"))
+        else:
+            soundscape_paths = [sc_dir / filename for filename in sorted(file_to_label_rows)]
+        for audio_path in soundscape_paths:
+            if not audio_path.exists():
+                continue
+            filename = audio_path.name
+            label_rows = file_to_label_rows.get(filename, [])
+            duration = soundscape_duration(audio_path, label_rows)
+            n_frames = max(1, int(math.ceil(duration / cfg.soundscape_window_sec)))
+            for frame_idx in range(n_frames):
+                start_sec = float(frame_idx * cfg.soundscape_window_sec)
+                end_sec = float(start_sec + cfg.soundscape_window_sec)
+                labels = labels_by_window.get(
+                    (filename, start_sec, end_sec),
+                    labels_by_start.get((filename, start_sec), []),
+                )
+                append_soundscape_row(
+                    audio_path=audio_path,
+                    filename=filename,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    labels=list(labels),
+                )
+    else:
+        for _, row in sc_labels_df.iterrows():
+            labels = [
+                label.strip()
+                for label in str(row["primary_label"]).split(";")
+                if label.strip() in valid_labels
+            ]
+            if not labels:
+                continue
+            audio_path = sc_dir / row["filename"]
+            if not audio_path.exists():
+                continue
+            start_sec = float(row["start_sec"])
+            end_sec = float(row.get("end_sec", start_sec + cfg.soundscape_window_sec))
+            append_soundscape_row(
+                audio_path=audio_path,
+                filename=str(row["filename"]),
+                start_sec=start_sec,
+                end_sec=end_sec,
+                labels=labels,
+            )
 
     sc_df = pd.DataFrame(sc_rows)
     train_df["all_labels"] = train_df.apply(
@@ -129,9 +223,13 @@ def build_train_df(cfg: CFG) -> pd.DataFrame:
     )
     combined_df = pd.concat([train_df, sc_df], ignore_index=True, sort=False)
     combined_df["primary_label"] = combined_df["primary_label"].astype(str)
+    soundscape_background = int(sc_df["is_background"].sum()) if not sc_df.empty else 0
+    soundscape_positive = int(len(sc_df) - soundscape_background)
     print(
         "Built training frame:",
-        f"train_audio={len(train_df)} soundscape={len(sc_df)} total={len(combined_df)}",
+        f"train_audio={len(train_df)} soundscape={len(sc_df)} "
+        f"soundscape_positive={soundscape_positive} soundscape_background={soundscape_background} "
+        f"total={len(combined_df)}",
     )
     return combined_df
 
@@ -158,6 +256,31 @@ class BirdCLEFDataset(Dataset):
             source = str(row.get("source", "train_audio"))
 
             if source == "pseudo_soundscape":
+                pseudo_type = str(row.get("pseudo_type", "positive"))
+                if pseudo_type == "background":
+                    targets[i, :] = 0.0
+                    masks[i, :] = 1.0
+                    continue
+
+                if pseudo_type == "hard_negative":
+                    targets[i, :] = 0.0
+                    masks[i, :] = 0.0
+                    hard_labels = parse_label_list(row.get("hard_negative_labels", "[]"))
+                    if not hard_labels:
+                        probs = [
+                            (label, float(row.get(f"pseudo_{label}", 0.0)))
+                            for label in self.species_ids
+                        ]
+                        ranked = sorted(probs, key=lambda item: item[1], reverse=True)
+                        hard_labels = [
+                            label for label, _ in ranked[: self.cfg.pseudo_hard_negative_max_labels]
+                        ]
+                    for label in hard_labels:
+                        idx = self.label2idx.get(label)
+                        if idx is not None:
+                            masks[i, idx] = 1.0
+                    continue
+
                 for label in self.species_ids:
                     idx = self.label2idx[label]
                     prob = row.get(f"pseudo_{label}", np.nan)
@@ -174,7 +297,7 @@ class BirdCLEFDataset(Dataset):
 
             if source == "soundscape":
                 labels = parse_label_list(row.get("all_labels", row.get("secondary_labels", "[]")))
-                if primary and primary != "nan":
+                if primary in self.label2idx:
                     labels = [primary] + [label for label in labels if label != primary]
                 for label in labels:
                     idx = self.label2idx.get(str(label).strip())
@@ -208,6 +331,11 @@ class BirdCLEFDataset(Dataset):
         if "pseudo_weight" in self.df.columns:
             sample_weights *= pd.to_numeric(
                 self.df["pseudo_weight"], errors="coerce"
+            ).fillna(1.0).to_numpy(dtype=np.float32)
+
+        if "row_weight" in self.df.columns:
+            sample_weights *= pd.to_numeric(
+                self.df["row_weight"], errors="coerce"
             ).fillna(1.0).to_numpy(dtype=np.float32)
 
         if "hard_negative_score" in self.df.columns:

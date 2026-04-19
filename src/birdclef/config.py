@@ -42,12 +42,25 @@ class CFG:
     waveform_lru_size: int = 256
     event_crop_jitter_sec: float = 2.5
     random_pad_train: bool = True
+    soundscape_window_sec: float = 5.0
+    soundscape_full_windows: bool = True
+    soundscape_include_unlabeled_files: bool = False
+    soundscape_background_label: str = "__background__"
+    soundscape_positive_weight: float = 1.00
+    soundscape_background_weight: float = 0.35
     pseudo_path: Path | None = None
     pseudo_min_primary_prob: float = 0.50
     pseudo_label_prob: float = 0.35
     pseudo_mask_prob: float = 0.10
     pseudo_max_labels: int = 5
     pseudo_sampling_weight: float = 0.40
+    pseudo_include_background: bool = True
+    pseudo_background_max_prob: float = 0.08
+    pseudo_background_weight: float = 0.12
+    pseudo_include_hard_negatives: bool = True
+    pseudo_hard_negative_min_prob: float = 0.20
+    pseudo_hard_negative_weight: float = 0.25
+    pseudo_hard_negative_max_labels: int = 5
     pseudo_teacher_tta_crops: int = 3
     pseudo_batch_size: int = 16
     pseudo_max_files: int | None = None
@@ -223,6 +236,18 @@ def parse_args() -> argparse.Namespace:
         cmd.add_argument("--pseudo-mask-prob", type=float, default=0.10)
         cmd.add_argument("--pseudo-max-labels", type=int, default=5)
         cmd.add_argument("--pseudo-sampling-weight", type=float, default=0.40)
+        cmd.add_argument("--disable-soundscape-full-windows", action="store_true")
+        cmd.add_argument("--include-unlabeled-soundscape-files", action="store_true")
+        cmd.add_argument("--soundscape-window-sec", type=float, default=5.0)
+        cmd.add_argument("--soundscape-positive-weight", type=float, default=1.00)
+        cmd.add_argument("--soundscape-background-weight", type=float, default=0.35)
+        cmd.add_argument("--disable-pseudo-background", action="store_true")
+        cmd.add_argument("--pseudo-background-max-prob", type=float, default=0.08)
+        cmd.add_argument("--pseudo-background-weight", type=float, default=0.12)
+        cmd.add_argument("--disable-pseudo-hard-negatives", action="store_true")
+        cmd.add_argument("--pseudo-hard-negative-min-prob", type=float, default=0.20)
+        cmd.add_argument("--pseudo-hard-negative-weight", type=float, default=0.25)
+        cmd.add_argument("--pseudo-hard-negative-max-labels", type=int, default=5)
         cmd.add_argument("--postprocess-params-path", type=Path, default=None)
         cmd.add_argument("--per-class-thresholds-path", type=Path, default=None)
         cmd.add_argument("--postprocess-file-level-top-k", type=int, default=2)
@@ -313,6 +338,18 @@ def build_cfg(args: argparse.Namespace) -> CFG:
     cfg.pseudo_mask_prob = args.pseudo_mask_prob
     cfg.pseudo_max_labels = args.pseudo_max_labels
     cfg.pseudo_sampling_weight = args.pseudo_sampling_weight
+    cfg.soundscape_full_windows = not args.disable_soundscape_full_windows
+    cfg.soundscape_include_unlabeled_files = args.include_unlabeled_soundscape_files
+    cfg.soundscape_window_sec = args.soundscape_window_sec
+    cfg.soundscape_positive_weight = args.soundscape_positive_weight
+    cfg.soundscape_background_weight = args.soundscape_background_weight
+    cfg.pseudo_include_background = not args.disable_pseudo_background
+    cfg.pseudo_background_max_prob = args.pseudo_background_max_prob
+    cfg.pseudo_background_weight = args.pseudo_background_weight
+    cfg.pseudo_include_hard_negatives = not args.disable_pseudo_hard_negatives
+    cfg.pseudo_hard_negative_min_prob = args.pseudo_hard_negative_min_prob
+    cfg.pseudo_hard_negative_weight = args.pseudo_hard_negative_weight
+    cfg.pseudo_hard_negative_max_labels = args.pseudo_hard_negative_max_labels
     cfg.postprocess_params_path = args.postprocess_params_path
     cfg.per_class_thresholds_path = args.per_class_thresholds_path
     cfg.postprocess_file_level_top_k = args.postprocess_file_level_top_k
