@@ -64,30 +64,84 @@ def label_counts(df: pd.DataFrame, species_ids: list[str]) -> dict[str, int]:
     return counts
 
 
+def _ensure_hard_negative_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "hard_negative_labels" not in out.columns:
+        out["hard_negative_labels"] = "[]"
+    else:
+        out["hard_negative_labels"] = out["hard_negative_labels"].fillna("[]")
+
+    if "hard_negative_count" not in out.columns:
+        out["hard_negative_count"] = out["hard_negative_labels"].apply(
+            lambda value: len(parse_label_list(value))
+        )
+    else:
+        inferred_count = out["hard_negative_labels"].apply(lambda value: len(parse_label_list(value)))
+        out["hard_negative_count"] = pd.to_numeric(
+            out["hard_negative_count"], errors="coerce"
+        ).fillna(inferred_count).astype(int)
+
+    if "hard_negative_score" not in out.columns:
+        if "pseudo_type" in out.columns and "pseudo_primary_prob" in out.columns:
+            is_hard_pseudo = out["pseudo_type"].astype(str).eq("hard_negative")
+            pseudo_score = pd.to_numeric(
+                out["pseudo_primary_prob"], errors="coerce"
+            ).fillna(0.0)
+            out["hard_negative_score"] = np.where(is_hard_pseudo, pseudo_score, 0.0)
+        else:
+            out["hard_negative_score"] = 0.0
+    else:
+        out["hard_negative_score"] = pd.to_numeric(
+            out["hard_negative_score"], errors="coerce"
+        ).fillna(0.0)
+    return out
+
+
 def attach_hard_negative_metadata(df: pd.DataFrame, cfg: CFG) -> pd.DataFrame:
     path = cfg.resolved_hard_negative_path
-    out = df.copy()
+    out = _ensure_hard_negative_columns(df)
     if not path.exists():
-        out["hard_negative_score"] = 0.0
-        out["hard_negative_count"] = 0
-        out["hard_negative_labels"] = "[]"
         return out
 
     hard_df = pd.read_csv(path)
     if hard_df.empty or "row_key" not in hard_df.columns:
-        out["hard_negative_score"] = 0.0
-        out["hard_negative_count"] = 0
-        out["hard_negative_labels"] = "[]"
         return out
 
     out["_row_key"] = dataframe_row_key(out)
     keep_cols = ["row_key", "hard_negative_score", "hard_negative_count", "hard_negative_labels"]
-    out = out.merge(hard_df[keep_cols], left_on="_row_key", right_on="row_key", how="left")
+    replay_df = hard_df[keep_cols].rename(
+        columns={
+            "hard_negative_score": "replay_hard_negative_score",
+            "hard_negative_count": "replay_hard_negative_count",
+            "hard_negative_labels": "replay_hard_negative_labels",
+        }
+    )
+    out = out.merge(replay_df, left_on="_row_key", right_on="row_key", how="left")
     out = out.drop(columns=["_row_key", "row_key"])
-    out["hard_negative_score"] = out["hard_negative_score"].fillna(0.0).astype(float)
-    out["hard_negative_count"] = out["hard_negative_count"].fillna(0).astype(int)
-    out["hard_negative_labels"] = out["hard_negative_labels"].fillna("[]")
-    matched = int((out["hard_negative_score"] > 0).sum())
+
+    replay_score = pd.to_numeric(
+        out.pop("replay_hard_negative_score"), errors="coerce"
+    ).fillna(0.0)
+    replay_count = pd.to_numeric(
+        out.pop("replay_hard_negative_count"), errors="coerce"
+    ).fillna(0).astype(int)
+    replay_labels = out.pop("replay_hard_negative_labels").fillna("[]")
+
+    has_existing_labels = out["hard_negative_labels"].apply(lambda value: len(parse_label_list(value)) > 0)
+    has_replay_labels = replay_labels.apply(lambda value: len(parse_label_list(value)) > 0)
+    use_replay = (~has_existing_labels) & has_replay_labels
+
+    out.loc[use_replay, "hard_negative_labels"] = replay_labels[use_replay]
+    out["hard_negative_score"] = np.maximum(
+        pd.to_numeric(out["hard_negative_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32),
+        replay_score.to_numpy(dtype=np.float32),
+    )
+    out["hard_negative_count"] = np.maximum(
+        pd.to_numeric(out["hard_negative_count"], errors="coerce").fillna(0).to_numpy(dtype=np.int32),
+        replay_count.to_numpy(dtype=np.int32),
+    )
+
+    matched = int((replay_score > 0).sum())
     if matched:
         print(f"Attached hard-negative replay rows: {matched}/{len(out)} from {path}")
     return out
