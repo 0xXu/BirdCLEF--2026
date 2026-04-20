@@ -261,7 +261,7 @@ def build_hard_negative_table_from_oof(
         )
 
     table = pd.DataFrame(rows)
-    out_path = cfg.resolved_hard_negative_path
+    out_path = cfg.output_dir / "hard_negatives.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(out_path, index=False)
     print(f"Saved hard-negative replay table to {out_path} | rows={len(table)}")
